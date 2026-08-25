@@ -1,0 +1,9 @@
+numpy==2.2.6
+scipy==1.15.3
+cobaya==3.6.2
+candl-like==2.0.3
+sacc==2.4
+astropy==6.1.7
+pandas==2.3.3
+PyYAML
+Cython
