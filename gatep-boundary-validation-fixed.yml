@@ -1,0 +1,96 @@
+name: Bubbleverse Gate P - BOUNDARY VALIDATION
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  COBAYA_PACKAGES_PATH: ${{ github.workspace }}/.cobaya
+  MAXICLASS_COMMIT: b5a3af9818d04d2fe696e54972545e8c6805f4ea
+  ACT_COMMIT: 0e0cd2c703c62a0e980470b572602233b27750e1
+  SPT_COMMIT: 2cec6e762a8c540484dd5acafc529f0035856350
+
+jobs:
+  boundary-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Bubbleverse repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system build/debug tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gfortran gdb git-lfs
+
+      - name: Install frozen Python environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-boundary-validation.txt
+
+      - name: Clone frozen theory and likelihood repositories
+        run: |
+          rm -rf external/mAxiCLASS external/DR6-ACT-lite external/spt_candl_data
+          mkdir -p external
+
+          git clone https://github.com/marcobeIIa/mAxiCLASS.git external/mAxiCLASS
+          git -C external/mAxiCLASS checkout "$MAXICLASS_COMMIT"
+
+          git clone https://github.com/ACTCollaboration/DR6-ACT-lite.git external/DR6-ACT-lite
+          git -C external/DR6-ACT-lite checkout "$ACT_COMMIT"
+
+          git clone https://github.com/SouthPoleTelescope/spt_candl_data.git external/spt_candl_data
+          git -C external/spt_candl_data checkout "$SPT_COMMIT"
+          git -C external/spt_candl_data lfs pull || true
+
+      - name: Build frozen mAxiCLASS
+        run: |
+          cd external/mAxiCLASS
+          python setup.py build
+
+      - name: Install frozen ACT likelihood and data
+        run: |
+          python -m pip install -e external/DR6-ACT-lite
+          mkdir -p "$COBAYA_PACKAGES_PATH"
+          cobaya-install act_dr6_cmbonly --packages-path "$COBAYA_PACKAGES_PATH"
+
+      - name: Verify ACT data exists
+        run: |
+          ACT_FILE="$COBAYA_PACKAGES_PATH/data/ACTDR6CMBonly/v1.0/dr6_data_cmbonly.fits"
+          if [ ! -s "$ACT_FILE" ]; then
+            echo "ERROR: Frozen ACT DR6 likelihood data not found at $ACT_FILE"
+            exit 1
+          fi
+          ls -lh "$ACT_FILE"
+          sha256sum "$ACT_FILE"
+
+      - name: Run Gate-P boundary diagnostic
+        run: |
+          python scripts/gatep_boundary_validation.py
+
+      - name: Add result to GitHub job summary
+        if: always()
+        run: |
+          if [ -f gatep_boundary_validation/BOUNDARY_VALIDATION_REPORT.md ]; then
+            cat gatep_boundary_validation/BOUNDARY_VALIDATION_REPORT.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Boundary validation report was not produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload complete validation artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gatep-boundary-validation-${{ github.run_id }}
+          path: gatep_boundary_validation/
+          if-no-files-found: warn
+          retention-days: 90
