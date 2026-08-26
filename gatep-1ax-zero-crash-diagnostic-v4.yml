@@ -1,0 +1,293 @@
+name: Bubbleverse Gate P - 1AX ZERO CRASH DIAGNOSTIC V4
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "surgical = exact/near-zero GDB; death = also rebuild debug binary + sanitizer pass"
+        required: true
+        default: surgical
+        type: choice
+        options:
+          - surgical
+          - death
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  MAXICLASS_COMMIT: b5a3af9818d04d2fe696e54972545e8c6805f4ea
+  ACT_COMMIT: 0e0cd2c703c62a0e980470b572602233b27750e1
+  SPT_COMMIT: 2cec6e762a8c540484dd5acafc529f0035856350
+  CANDL_VERSION: "2.0.3"
+  COBAYA_VERSION: "3.6.2"
+
+jobs:
+  crash-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout Bubbleverse
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Create diagnostic output directory
+        shell: bash
+        run: |
+          mkdir -p gatep_1ax_crash_diagnostic/provenance
+
+      - name: Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Native debugger toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            gdb \
+            binutils \
+            build-essential \
+            gfortran \
+            libgomp1 \
+            jq
+
+      - name: Python dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip setuptools wheel Cython
+          python -m pip install \
+            "cobaya==${COBAYA_VERSION}" \
+            "candl-like==${CANDL_VERSION}" \
+            scipy numpy pyyaml sacc astropy
+
+      - name: Frozen external repositories
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p external
+
+          if [ ! -d external/mAxiCLASS/.git ]; then
+            git clone https://github.com/marcobeIIa/mAxiCLASS.git external/mAxiCLASS
+          fi
+          git -C external/mAxiCLASS fetch --all --tags --prune
+          git -C external/mAxiCLASS checkout --detach "${MAXICLASS_COMMIT}"
+          test "$(git -C external/mAxiCLASS rev-parse HEAD)" = "${MAXICLASS_COMMIT}"
+
+          if [ ! -d external/DR6-ACT-lite/.git ]; then
+            git clone https://github.com/ACTCollaboration/DR6-ACT-lite.git external/DR6-ACT-lite
+          fi
+          git -C external/DR6-ACT-lite fetch --all --tags --prune
+          git -C external/DR6-ACT-lite checkout --detach "${ACT_COMMIT}"
+          test "$(git -C external/DR6-ACT-lite rev-parse HEAD)" = "${ACT_COMMIT}"
+
+          if [ ! -d external/spt_candl_data/.git ]; then
+            git clone https://github.com/SouthPoleTelescope/spt_candl_data.git external/spt_candl_data
+          fi
+          git -C external/spt_candl_data fetch --all --tags --prune
+          git -C external/spt_candl_data checkout --detach "${SPT_COMMIT}"
+          test "$(git -C external/spt_candl_data rev-parse HEAD)" = "${SPT_COMMIT}"
+
+          # IMPORTANT: do not install PyPI classy. The frozen mAxiCLASS
+          # checkout is the sole authoritative classy provider for Gate P.
+          python -m pip uninstall -y classy || true
+          python -m pip install --no-build-isolation -e external/mAxiCLASS
+          python -m pip install -e external/DR6-ACT-lite
+          python -m pip install -e external/spt_candl_data
+
+          python - <<'PY'
+          import classy
+          print("classy imported from:", classy.__file__)
+          PY
+
+      - name: Verify frozen mAxiCLASS installation
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          MAXICLASS_BUILD_DIR="$(python - <<'PY'
+          import os, classy
+          print(os.path.dirname(os.path.realpath(classy.__file__)))
+          PY
+          )"
+
+          test -n "${MAXICLASS_BUILD_DIR}"
+          echo "MAXICLASS_BUILD_DIR=${MAXICLASS_BUILD_DIR}" >> "$GITHUB_ENV"
+
+          python - <<'PY'
+          import os, pathlib, classy
+          actual = pathlib.Path(classy.__file__).resolve()
+          repo = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "external" / "mAxiCLASS"
+          print("classy.__file__ =", actual)
+          print("frozen repo =", repo.resolve())
+
+          frozen = repo.resolve()
+          print("classy resolved path =", actual)
+          print("frozen mAxiCLASS repo =", frozen)
+          try:
+              actual.relative_to(frozen)
+          except ValueError:
+              raise SystemExit(f"FAIL: classy import is outside frozen mAxiCLASS checkout: {actual}")
+          PY
+
+      - name: Restore and verify BBN runtime data
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          CLASS_SITE_ROOT="$(python - <<'PY'
+          import importlib.util, os
+          spec = importlib.util.find_spec("class")
+          if spec and spec.submodule_search_locations:
+              print(list(spec.submodule_search_locations)[0])
+          else:
+              import site
+              print(os.path.join(site.getsitepackages()[0], "class"))
+          PY
+          )"
+
+          TARGET="${CLASS_SITE_ROOT}/external/bbn/sBBN_2025.dat"
+          SOURCE="$(find external/mAxiCLASS -path '*/external/bbn/sBBN_2025.dat' -type f | head -n1 || true)"
+
+          if [ ! -r "${TARGET}" ]; then
+            test -n "${SOURCE}"
+            sudo mkdir -p "$(dirname "${TARGET}")"
+            sudo cp "${SOURCE}" "${TARGET}"
+          fi
+
+          test -r "${TARGET}"
+          echo "CLASS_SITE_ROOT=${CLASS_SITE_ROOT}" >> "$GITHUB_ENV"
+          echo "SBBN_PATH=${TARGET}" >> "$GITHUB_ENV"
+          sha256sum "${TARGET}"
+
+      - name: Prepare ACT frozen data
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PYTHONPATH="${GITHUB_WORKSPACE}/external/DR6-ACT-lite:${PYTHONPATH:-}"
+          mkdir -p .cobaya
+
+          # Reuse already committed/cached data if present. Otherwise ask Cobaya's
+          # frozen likelihood package to install only the required ACT dataset.
+          if [ ! -r ".cobaya/data/ACTDR6CMBonly/v1.0/dr6_data_cmbonly.fits" ]; then
+            cobaya-install \
+              act_dr6_cmbonly.ACTDR6CMBonly \
+              --packages-path "${GITHUB_WORKSPACE}/.cobaya" \
+              --debug
+          fi
+
+          test -r ".cobaya/data/ACTDR6CMBonly/v1.0/dr6_data_cmbonly.fits"
+          sha256sum ".cobaya/data/ACTDR6CMBonly/v1.0/dr6_data_cmbonly.fits"
+
+      - name: Hard preflight — exact execution context
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PYTHONPATH="${MAXICLASS_BUILD_DIR}:${GITHUB_WORKSPACE}/external/DR6-ACT-lite:${GITHUB_WORKSPACE}/external/spt_candl_data:${PYTHONPATH:-}"
+
+          mkdir -p gatep_1ax_crash_diagnostic/provenance
+
+          python - <<'PY' | tee gatep_1ax_crash_diagnostic/provenance/imports.txt
+          import hashlib, importlib, os, sys
+          import classy
+          import candl
+          import spt_candl_data
+          import act_dr6_cmbonly
+
+          print("python =", sys.executable)
+          print("classy.__file__ =", classy.__file__)
+          print("candl.__file__ =", candl.__file__)
+          print("candl.__version__ =", getattr(candl, "__version__", None))
+          print("spt_candl_data.__file__ =", spt_candl_data.__file__)
+          print("act_dr6_cmbonly.__file__ =", act_dr6_cmbonly.__file__)
+
+          actual = os.path.realpath(classy.__file__)
+          frozen_repo = os.path.realpath(os.path.join(os.environ["GITHUB_WORKSPACE"], "external", "mAxiCLASS"))
+          print("classy resolved path =", actual)
+          print("frozen mAxiCLASS repo =", frozen_repo)
+          if not (actual == frozen_repo or actual.startswith(frozen_repo + os.sep)):
+              raise SystemExit(
+                  f"WRONG CLASSY IMPORT ROUTING: {actual} is outside frozen mAxiCLASS repo {frozen_repo}"
+              )
+
+          bbn = os.environ["SBBN_PATH"]
+          if not os.path.isfile(bbn) or not os.access(bbn, os.R_OK):
+              raise SystemExit(f"BBN FILE NOT READABLE: {bbn}")
+          h = hashlib.sha256(open(bbn, "rb").read()).hexdigest()
+          print("sBBN_2025.dat =", bbn)
+          print("sBBN_2025.sha256 =", h)
+
+          if getattr(candl, "__version__", None) != "2.0.3":
+              raise SystemExit("candl version is not frozen 2.0.3")
+          PY
+
+          git -C external/mAxiCLASS rev-parse HEAD | tee gatep_1ax_crash_diagnostic/provenance/maxiclass-commit.txt
+          git -C external/DR6-ACT-lite rev-parse HEAD | tee gatep_1ax_crash_diagnostic/provenance/act-commit.txt
+          git -C external/spt_candl_data rev-parse HEAD | tee gatep_1ax_crash_diagnostic/provenance/spt-commit.txt
+          gdb --version | head -n1 | tee gatep_1ax_crash_diagnostic/provenance/gdb-version.txt
+          python -m pip freeze > gatep_1ax_crash_diagnostic/provenance/pip-freeze.txt
+
+      - name: Run surgical 1ax boundary matrix under GDB
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PYTHONPATH="${MAXICLASS_BUILD_DIR}:${GITHUB_WORKSPACE}/external/DR6-ACT-lite:${GITHUB_WORKSPACE}/external/spt_candl_data:${PYTHONPATH:-}"
+          python scripts/gatep_1ax_crash_diagnostic.py \
+            --workspace "${GITHUB_WORKSPACE}" \
+            --mode surgical
+
+      - name: Death-mode debug rebuild and sanitizer pass
+        if: ${{ inputs.mode == 'death' }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+
+          mkdir -p gatep_1ax_crash_diagnostic/death_build
+          cp -a external/mAxiCLASS gatep_1ax_crash_diagnostic/death_build/mAxiCLASS-debug
+          cd gatep_1ax_crash_diagnostic/death_build/mAxiCLASS-debug
+          rm -rf build
+
+          export CFLAGS="-O0 -g3 -fno-omit-frame-pointer -fno-optimize-sibling-calls"
+          export CXXFLAGS="${CFLAGS}"
+          export FFLAGS="-O0 -g3 -fno-omit-frame-pointer"
+          python setup.py build
+          cd "${GITHUB_WORKSPACE}"
+
+          DEBUG_BUILD="$(find gatep_1ax_crash_diagnostic/death_build/mAxiCLASS-debug/build -maxdepth 1 -type d -name 'lib.*' | head -n1)"
+          test -n "${DEBUG_BUILD}"
+
+          export MAXICLASS_BUILD_DIR="${GITHUB_WORKSPACE}/${DEBUG_BUILD}"
+          export PYTHONPATH="${MAXICLASS_BUILD_DIR}:${GITHUB_WORKSPACE}/external/DR6-ACT-lite:${GITHUB_WORKSPACE}/external/spt_candl_data:${PYTHONPATH:-}"
+
+          python scripts/gatep_1ax_crash_diagnostic.py \
+            --workspace "${GITHUB_WORKSPACE}" \
+            --mode death \
+            --tag debug-symbols
+
+      - name: Final classification
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          python scripts/gatep_1ax_crash_diagnostic.py \
+            --workspace "${GITHUB_WORKSPACE}" \
+            --summarize-only || true
+
+          echo "========== CRASH SUMMARY =========="
+          cat gatep_1ax_crash_diagnostic/CRASH_DIAGNOSTIC_REPORT.md 2>/dev/null || true
+
+      - name: Upload complete crash artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gatep-1ax-crash-diagnostic-${{ github.run_id }}
+          path: gatep_1ax_crash_diagnostic
+          if-no-files-found: warn
+          retention-days: 30
