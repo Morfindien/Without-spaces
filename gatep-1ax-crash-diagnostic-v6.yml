@@ -1,0 +1,203 @@
+name: Bubbleverse Gate P - 1AX CRASH DIAGNOSTIC V6
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  crash-diagnostic-v6:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout frozen case repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Install native debugger and Python dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gdb build-essential gfortran
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install 'cobaya==3.6.2' 'candl==2.0.3' scipy pyyaml
+
+      - name: Verify frozen commits
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(git -C external/mAxiCLASS rev-parse HEAD)" = "b5a3af9818d04d2fe696e54972545e8c6805f4ea"
+          test "$(git -C external/DR6-ACT-lite rev-parse HEAD)" = "0e0cd2c703c62a0e980470b572602233b27750e1"
+          test "$(git -C external/spt_candl_data rev-parse HEAD)" = "2cec6e762a8c540484dd5acafc529f0035856350"
+
+      - name: Build frozen mAxiCLASS in-place if needed
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! compgen -G 'external/mAxiCLASS/classy*.so' >/dev/null; then
+            make -C external/mAxiCLASS -j2 classy
+          fi
+          ls -la external/mAxiCLASS/classy*.so
+
+      - name: Freeze import routing
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "PYTHONPATH=$GITHUB_WORKSPACE/external/mAxiCLASS:$GITHUB_WORKSPACE/external/DR6-ACT-lite:$GITHUB_WORKSPACE/external/spt_candl_data:${PYTHONPATH:-}" >> "$GITHUB_ENV"
+          python - <<'PY'
+          import hashlib, pathlib, classy
+          root = pathlib.Path.cwd().resolve()
+          p = pathlib.Path(classy.__file__).resolve()
+          print("classy.__file__ =", p)
+          assert root / "external" / "mAxiCLASS" in p.parents, p
+          bbn = root / "external" / "mAxiCLASS" / "external" / "bbn" / "sBBN_2025.dat"
+          assert bbn.is_file(), bbn
+          h = hashlib.sha256(bbn.read_bytes()).hexdigest()
+          print("sBBN_2025.sha256 =", h)
+          assert h == "321b3adc1ffd711d67be1f5a56948191a1121bf1e4864aa0212c4aa556ee670e"
+          PY
+
+      - name: Run positive-amplitude loader sanity gate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf gatep_1ax_crash_diagnostic_v6
+          mkdir -p gatep_1ax_crash_diagnostic_v6
+          set +e
+          python -u scripts/gatep_1ax_crash_diagnostic_v6.py \
+            --fraction 1e-6 \
+            --outdir gatep_1ax_crash_diagnostic_v6/sanity_f_1em06 \
+            2>&1 | tee gatep_1ax_crash_diagnostic_v6/sanity_f_1em06.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          # Do not proceed to crash classification if Cobaya still cannot load frozen CLASS.
+          if grep -q 'Could not find CLASS' gatep_1ax_crash_diagnostic_v6/sanity_f_1em06.log; then
+            echo 'FATAL: Cobaya frozen-classy routing is still broken.'
+            exit 90
+          fi
+          if grep -q 'Cobaya/preflight classy mismatch' gatep_1ax_crash_diagnostic_v6/sanity_f_1em06.log; then
+            echo 'FATAL: Cobaya and preflight imported different classy binaries.'
+            exit 91
+          fi
+          echo "sanity_exit=$rc" | tee gatep_1ax_crash_diagnostic_v6/sanity-exit.txt
+
+      - name: Run exact-zero and boundary matrix under GDB
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p gatep_1ax_crash_diagnostic_v6/runs
+          : > gatep_1ax_crash_diagnostic_v6/matrix.tsv
+          printf 'label\tfraction\tgdb_exit\tsigsegv\tfinite_result\n' >> gatep_1ax_crash_diagnostic_v6/matrix.tsv
+
+          run_case() {
+            label="$1"
+            fraction="$2"
+            out="gatep_1ax_crash_diagnostic_v6/runs/$label"
+            mkdir -p "$out"
+
+            set +e
+            gdb -q -batch \
+              -ex 'set pagination off' \
+              -ex 'set confirm off' \
+              -ex 'handle SIGSEGV stop print pass' \
+              -ex run \
+              -ex 'thread apply all bt full' \
+              -ex 'frame' \
+              -ex 'info args' \
+              -ex 'info locals' \
+              -ex 'info registers' \
+              -ex 'x/16i $pc-32' \
+              --args python -u scripts/gatep_1ax_crash_diagnostic_v6.py \
+                --fraction "$fraction" \
+                --outdir "$out" \
+              > "$out/gdb.log" 2>&1
+            rc=$?
+            set -e
+
+            sigsegv=false
+            finite=false
+            grep -Eq 'Program received signal SIGSEGV|SIGSEGV, Segmentation fault|signal SIGSEGV' "$out/gdb.log" && sigsegv=true
+            if test -f "$out/result.json" && grep -q '"status": "FINITE"' "$out/result.json"; then
+              finite=true
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$fraction" "$rc" "$sigsegv" "$finite" >> gatep_1ax_crash_diagnostic_v6/matrix.tsv
+          }
+
+          set -e
+          run_case f_0 0
+          run_case f_1em14 1e-14
+          run_case f_1em12 1e-12
+          run_case f_1em10 1e-10
+          run_case f_1em08 1e-8
+          run_case f_1em06 1e-6
+
+          cat gatep_1ax_crash_diagnostic_v6/matrix.tsv
+
+      - name: Classify diagnostic without making a physical Gate-P claim
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import json
+
+          root = Path('gatep_1ax_crash_diagnostic_v6')
+          rows = []
+          lines = (root/'matrix.tsv').read_text().strip().splitlines()
+          for line in lines[1:]:
+              label, frac, gdb_exit, sigsegv, finite = line.split('\t')
+              rows.append({
+                  'label': label,
+                  'fraction': float(frac),
+                  'gdb_exit': int(gdb_exit),
+                  'sigsegv': sigsegv == 'true',
+                  'finite': finite == 'true',
+              })
+
+          zero = rows[0]
+          positives = rows[1:]
+          if zero['sigsegv'] and all(r['finite'] for r in positives):
+              cls = 'EXACT_ZERO_IMPLEMENTATION_DEFECT_STRONGLY_CONFIRMED'
+          elif zero['sigsegv'] and any(r['finite'] for r in positives):
+              cls = 'BOUNDARY_OR_TRANSITION_DEFECT_SUPPORTED'
+          elif zero['sigsegv'] and all(r['sigsegv'] for r in positives):
+              cls = 'BROADER_1AX_IMPLEMENTATION_DEFECT'
+          elif zero['finite']:
+              cls = 'PREVIOUS_EXACT_ZERO_CRASH_NOT_REPRODUCED'
+          else:
+              cls = 'UNRESOLVED_1AX_FAILURE'
+
+          payload = {
+              'case': 'CASE-Q013',
+              'technical_classification': cls,
+              'physical_gate_p_verdict': 'NOT_EVALUATED',
+              'routing_note': 'Any crash, non-finite result, loader failure, or missing ACT/SPT component is invalid for physical/nesting interpretation.',
+              'matrix': rows,
+              'frozen_commits': {
+                  'mAxiCLASS': 'b5a3af9818d04d2fe696e54972545e8c6805f4ea',
+                  'ACT_DR6_lite': '0e0cd2c703c62a0e980470b572602233b27750e1',
+                  'SPT_candl_data': '2cec6e762a8c540484dd5acafc529f0035856350',
+              },
+          }
+          (root/'CRASH_DIAGNOSTIC_RESULT_V6.json').write_text(json.dumps(payload, indent=2)+'\n')
+          print(json.dumps(payload, indent=2))
+          PY
+
+      - name: Upload complete diagnostic artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gatep-1ax-crash-diagnostic-v6
+          path: gatep_1ax_crash_diagnostic_v6/
+          if-no-files-found: warn
+          retention-days: 30
